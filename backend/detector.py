@@ -1,15 +1,14 @@
 
 """Anomaly detection for solar and wind telemetry.
 
-Detection methods:
-1. Statistical rules using robust Z-scores (median and MAD).
+Methods:
+1. Robust statistical z-scores using median and MAD.
 2. Isolation Forest for unsupervised anomaly detection.
 
 Severity:
-- HIGH: Statistical rule and Isolation Forest both detect an anomaly.
-- MEDIUM: Statistical rule detects an anomaly.
-- WATCH: Isolation Forest detects an anomaly with a strong Z-score.
-- NORMAL: No anomaly detected.
+- HIGH: statistical rule and Isolation Forest agree.
+- MEDIUM: statistical rule only.
+- WATCH: Isolation Forest flags a sufficiently unusual reading.
 """
 
 import numpy as np
@@ -26,11 +25,11 @@ WATCH_Z = 2.5
 CONTAMINATION = 0.03
 
 NUM = [
-    'irradiance_wm2',
-    'wind_speed_ms',
-    'temperature_c',
-    'vibration_mm_s',
-    'power_mw'
+    "irradiance_wm2",
+    "wind_speed_ms",
+    "temperature_c",
+    "vibration_mm_s",
+    "power_mw",
 ]
 
 
@@ -39,10 +38,9 @@ NUM = [
 # --------------------------------------------------
 
 def _rz(x, floor):
-    """Calculate robust Z-scores using median and MAD."""
+    """Calculate robust z-scores using median and MAD."""
 
     x = pd.Series(x)
-
     med = x.median()
     mad = (x - med).abs().median()
 
@@ -52,40 +50,36 @@ def _rz(x, floor):
 
 
 # --------------------------------------------------
-# LOAD AND PREPROCESS DATA
+# DATA LOADING AND PREPROCESSING
 # --------------------------------------------------
 
 def load(path):
-    """Load, clean and prepare telemetry data."""
 
     df = pd.read_csv(path)
 
-    # Convert numerical columns and handle invalid values.
     df[NUM] = df[NUM].apply(
         pd.to_numeric,
-        errors='coerce'
+        errors="coerce"
     )
 
-    # Remove duplicates and sort readings.
     df = (
         df.drop_duplicates()
-        .sort_values(['asset_id', 'timestamp_id'])
+        .sort_values(["asset_id", "timestamp_id"])
         .reset_index(drop=True)
     )
 
-    # Fill missing numerical values within each asset.
-    df[NUM] = df.groupby('asset_id')[NUM].transform(
-        lambda s: s.interpolate(limit_direction='both')
+    df[NUM] = df.groupby("asset_id")[NUM].transform(
+        lambda s: s.interpolate(limit_direction="both")
     )
 
-    # Derive day number from sequential hourly readings.
-    df['day'] = df.groupby('asset_id').cumcount() // 24 + 1
+    df["day"] = (
+        df.groupby("asset_id").cumcount() // 24 + 1
+    )
 
-    # Identify solar and wind assets.
-    df['asset_type'] = np.where(
-        df.asset_id.str.upper().str.startswith('SOLAR'),
-        'solar',
-        'wind'
+    df["asset_type"] = np.where(
+        df.asset_id.str.upper().str.startswith("SOLAR"),
+        "solar",
+        "wind"
     )
 
     return df
@@ -96,68 +90,78 @@ def load(path):
 # --------------------------------------------------
 
 def add_features(df):
-    """Create features used by the anomaly detection models."""
 
     parts = []
 
-    for _, g in df.groupby('asset_id'):
+    for _, g in df.groupby("asset_id"):
 
         g = g.copy()
 
-        # Compare temperature with the typical temperature
-        # recorded during the same hour.
-        g['temp_resid'] = (
+        # Temperature deviation from the usual value
+        # for the same hour.
+
+        g["temp_resid"] = (
             g.temperature_c
-            - g.groupby('hour').temperature_c.transform('median')
+            - g.groupby("hour").temperature_c.transform("median")
         )
 
-        g['temp_z'] = _rz(g.temp_resid, 1.0).values
+        g["temp_z"] = _rz(g.temp_resid, 1.0).values
 
         # Vibration anomaly score.
-        g['vib_z'] = _rz(g.vibration_mm_s, 0.05).values
 
-        # Select the relevant power driver.
+        g["vib_z"] = _rz(
+            g.vibration_mm_s,
+            0.05
+        ).values
+
+        # Select the appropriate power driver.
+
         driver = (
-            'irradiance_wm2'
-            if g.asset_type.iloc[0] == 'solar'
-            else 'wind_speed_ms'
+            "irradiance_wm2"
+            if g.asset_type.iloc[0] == "solar"
+            else "wind_speed_ms"
         )
 
         # Estimate expected power using a cubic polynomial.
-        coefficients = np.polyfit(
+
+        coef = np.polyfit(
             g[driver],
             g.power_mw,
             3
         )
 
-        predicted = np.polyval(coefficients, g[driver])
+        residual = (
+            g.power_mw
+            - np.polyval(coef, g[driver])
+        )
 
-        residual = g.power_mw - predicted
+        # Refit after excluding large residuals.
 
-        # Remove extreme residuals and refit the model.
         keep = residual.abs() <= (
-            3 * max(1.4826 * residual.abs().median(), 0.03)
+            3 * max(
+                1.4826 * residual.abs().median(),
+                0.03
+            )
         )
 
         if keep.sum() > 10:
-            coefficients = np.polyfit(
+
+            coef = np.polyfit(
                 g.loc[keep, driver],
-                g.loc[keep, 'power_mw'],
+                g.loc[keep, "power_mw"],
                 3
             )
 
-        # Expected power output.
-        g['expected_power_mw'] = np.polyval(
-            coefficients,
+        g["expected_power_mw"] = np.polyval(
+            coef,
             g[driver]
         ).clip(min=0)
 
-        # Difference between actual and expected power.
-        g['power_resid'] = (
+        g["power_resid"] = (
             g.power_mw - g.expected_power_mw
         )
 
-        g['power_z'] = _rz(
+        g["power_z"] = _rz(
             g.power_resid,
             0.03
         ).values
@@ -172,57 +176,59 @@ def add_features(df):
 # --------------------------------------------------
 
 def detect(df):
-    """Detect abnormal telemetry using rules and Isolation Forest."""
 
     f = add_features(df)
 
-    # Statistical anomaly rules.
-    f['rule_vib'] = f.vib_z > Z_THRESH
+    # Statistical rules.
 
-    f['rule_temp'] = f.temp_z > Z_THRESH
+    f["rule_vib"] = f.vib_z > Z_THRESH
 
-    # Negative power residual indicates under-performance.
-    f['rule_power'] = f.power_z < -Z_THRESH
+    f["rule_temp"] = f.temp_z > Z_THRESH
 
-    f['rule_flag'] = f[
-        ['rule_vib', 'rule_temp', 'rule_power']
+    f["rule_power"] = f.power_z < -Z_THRESH
+
+    f["rule_flag"] = f[
+        ["rule_vib", "rule_temp", "rule_power"]
     ].any(axis=1)
 
-    # Features supplied to Isolation Forest.
-    X = f[['temp_z', 'vib_z', 'power_z']]
+    # Isolation Forest.
 
-    # Train unsupervised anomaly detection model.
+    X = f[
+        ["temp_z", "vib_z", "power_z"]
+    ]
+
     iso = IsolationForest(
         n_estimators=200,
         contamination=CONTAMINATION,
         random_state=42
     )
 
-    f['if_flag'] = iso.fit_predict(X) == -1
+    f["if_flag"] = iso.fit_predict(X) == -1
 
-    # Higher score means more abnormal.
-    f['if_score'] = -iso.score_samples(X)
+    f["if_score"] = -iso.score_samples(X)
 
-    # Require a sufficiently strong deviation for WATCH events.
+    # Only sufficiently unusual Isolation Forest
+    # results are included.
+
     strong = X.abs().max(axis=1) >= WATCH_Z
 
-    f['flagged'] = (
-        f.rule_flag | (f.if_flag & strong)
+    f["flagged"] = (
+        f.rule_flag
+        | (f.if_flag & strong)
     )
 
-    # Assign severity.
-    f['severity'] = np.select(
+    f["severity"] = np.select(
         [
             f.rule_flag & f.if_flag,
             f.rule_flag,
             f.flagged
         ],
         [
-            'high',
-            'medium',
-            'watch'
+            "high",
+            "medium",
+            "watch"
         ],
-        default='normal'
+        default="normal"
     )
 
     return f
@@ -234,39 +240,45 @@ def detect(df):
 
 CHECKS = {
 
-    'vib+temp': [
+    "vib_temp": [
         "Inspect bearings and lubrication",
         "Check mounting bolts and looseness",
         "Check cooling fan and vents"
     ],
 
-    'temp': [
+    "temp_high": [
         "Check cooling fan, vents and filters",
         "Look for blocked airflow or high load",
         "Verify the temperature sensor"
     ],
 
-    'vib': [
+    "temp_low": [
+        "Verify the temperature sensor reading",
+        "Check operating conditions and ambient temperature",
+        "Compare readings with similar assets"
+    ],
+
+    "vib": [
         "Inspect bearings and drive-train alignment",
         "Check mounting and balance",
         "Verify the vibration sensor"
     ],
 
-    'power_wind': [
-        "Check pitch/yaw alignment and any curtailment order",
+    "power_wind": [
+        "Check pitch/yaw alignment and curtailment orders",
         "Check for derating or a controller fault",
         "Compare with neighbouring turbines"
     ],
 
-    'power_solar': [
+    "power_solar": [
         "Check inverter status and derating alarms",
         "Look for shading, soiling or string faults",
         "Compare with neighbouring inverters"
     ],
 
-    'review': [
+    "general": [
         "Verify the sensor readings",
-        "Review current operating conditions",
+        "Check operating conditions",
         "Compare with neighbouring assets"
     ]
 }
@@ -277,225 +289,285 @@ CHECKS = {
 # --------------------------------------------------
 
 def _event(aid, e, f):
-    """Convert abnormal readings into an operator-friendly event."""
 
     base = f[f.asset_id == aid]
 
-    atype = e.asset_type.iloc[0]
+    asset_type = e.asset_type.iloc[0]
 
-    vib = e.rule_vib.any()
-    tmp = e.rule_temp.any()
-    pw = e.rule_power.any()
+    vib = bool(e.rule_vib.any())
+    temp_high = bool(e.rule_temp.any())
+    power_low = bool(e.rule_power.any())
 
-    # For WATCH-only events, select the strongest signal.
-    if not (vib or tmp or pw):
+    # Determine the strongest signal for watch-only events.
+
+    if not (vib or temp_high or power_low):
 
         col = (
-            e[['temp_z', 'vib_z', 'power_z']]
+            e[["temp_z", "vib_z", "power_z"]]
             .abs()
             .max()
             .idxmax()
         )
 
-        vib = col == 'vib_z'
-        tmp = col == 'temp_z'
-        pw = col == 'power_z'
+        vib = col == "vib_z"
+
+        if col == "temp_z":
+            temp_high = (
+                e.temp_resid.abs().max() > 0
+                and e.loc[
+                    e.temp_resid.abs().idxmax(),
+                    "temp_resid"
+                ] > 0
+            )
+
+    # Identify the largest temperature deviation
+    # while preserving its direction.
+
+    temp_row = e.loc[
+        e.temp_resid.abs().idxmax()
+    ]
+
+    temp_delta = float(temp_row.temp_resid)
+
+    temp_low = (
+        not temp_high
+        and not vib
+        and not power_low
+        and temp_delta < 0
+        and "temp_z" in e[
+            ["temp_z", "vib_z", "power_z"]
+        ].abs().max().idxmax()
+    )
+
+    # For events containing a high temperature rule,
+    # describe the actual elevated temperature.
+
+    if temp_high:
+        temp_low = False
+
+    # Power deviation and its direction.
+
+    power_row = e.loc[
+        e.power_resid.abs().idxmax()
+    ]
+
+    power_delta = float(power_row.power_resid)
+
+    if not (vib or temp_high or temp_low or power_low):
+        # Handle unusual power-only watch events.
+        strongest = (
+            e[["temp_z", "vib_z", "power_z"]]
+            .abs()
+            .max()
+            .idxmax()
+        )
+
+        if strongest == "power_z":
+            power_low = power_delta < 0
 
     parts = []
 
-    # Vibration explanation.
     if vib:
 
-        peak_vib = e.vibration_mm_s.max()
+        parts.append(
+            f"vibration peaked at "
+            f"{e.vibration_mm_s.max():.2f} mm/s "
+            f"(normal is about "
+            f"{base.vibration_mm_s.median():.2f})"
+        )
 
-        normal_vib = base.vibration_mm_s.median()
+    if temp_high:
 
         parts.append(
-            f"vibration peaked at {peak_vib:.2f} mm/s "
-            f"(normal is about {normal_vib:.2f})"
+            f"temperature was "
+            f"{temp_delta:.1f} °C above the usual "
+            f"for this hour "
+            f"(reading {temp_row.temperature_c:.1f} °C)"
         )
 
-    # Temperature explanation.
-    if tmp:
-
-        idx = e.temp_resid.abs().idxmax()
-
-        temp_delta = e.loc[idx, 'temp_resid']
-
-        peak_temp = e.loc[idx, 'temperature_c']
-
-        direction = (
-            "above" if temp_delta >= 0 else "below"
-        )
+    elif temp_low:
 
         parts.append(
-            f"temperature was {abs(temp_delta):.1f} °C "
-            f"{direction} the usual for this hour "
-            f"(reading {peak_temp:.1f} °C)"
+            f"temperature was "
+            f"{abs(temp_delta):.1f} °C below the usual "
+            f"for this hour "
+            f"(reading {temp_row.temperature_c:.1f} °C)"
         )
 
-    # Power explanation.
-    if pw:
-
-        idx = e.power_resid.abs().idxmax()
-
-        power_delta = e.loc[idx, 'power_resid']
-
-        direction = (
-            "below" if power_delta < 0 else "above"
-        )
-
-        driver_name = (
-            "sunlight" if atype == 'solar' else "wind speed"
-        )
+    if power_low:
 
         parts.append(
-            f"power was {abs(power_delta):.2f} MW "
-            f"{direction} the expected output based on "
-            f"{driver_name}"
+            f"power was "
+            f"{abs(power_delta):.2f} MW below "
+            f"the expected output based on "
+            f"{'sunlight' if asset_type == 'solar' else 'wind speed'}"
         )
 
-    # Select an appropriate explanation and checks.
-    if vib and tmp and e.temp_resid.max() > 0:
+    # Select explanation and recommended checks.
 
-        key = 'vib+temp'
+    if vib and temp_high:
 
-    elif tmp and e.temp_resid.max() > 0:
+        key = "vib_temp"
 
-        key = 'temp'
+        meaning = (
+            "Vibration and heat rising together may indicate "
+            "a mechanical problem such as a worn bearing "
+            "or loose component."
+        )
+
+    elif temp_high:
+
+        key = "temp_high"
+
+        meaning = (
+            "Elevated temperature without extra vibration "
+            "may indicate a cooling or airflow problem."
+        )
+
+    elif temp_low:
+
+        key = "temp_low"
+
+        meaning = (
+            "A lower-than-usual temperature is an unusual "
+            "reading that should be checked against sensor "
+            "accuracy and operating conditions."
+        )
 
     elif vib:
 
-        key = 'vib'
+        key = "vib"
 
-    elif pw and e.power_resid.min() < 0:
+        meaning = (
+            "Extra vibration may indicate mechanical imbalance "
+            "or a sensor issue."
+        )
 
-        key = f'power_{atype}'
+    elif power_low:
+
+        key = f"power_{asset_type}"
+
+        if asset_type == "wind":
+
+            meaning = (
+                "Low output at the observed wind speed may "
+                "indicate derating, pitch/yaw issues or curtailment."
+            )
+
+        else:
+
+            meaning = (
+                "Low output under the observed sunlight may "
+                "indicate inverter derating, shading or soiling."
+            )
 
     else:
 
-        # Do not describe low temperature as overheating
-        # or higher-than-expected power as under-performance.
-        key = 'review'
+        key = "general"
 
-    meanings = {
-
-        'vib+temp': (
-            "Vibration and heat rising together may indicate "
-            "a mechanical problem such as a worn bearing or loose part."
-        ),
-
-        'temp': (
-            "Elevated temperature without extra vibration may indicate "
-            "a cooling or airflow problem."
-        ),
-
-        'vib': (
-            "Extra vibration may indicate a mechanical imbalance, "
-            "loose mounting or sensor issue."
-        ),
-
-        'power_wind': (
-            "Low output at normal wind speed may indicate derating, "
-            "a pitch/yaw issue or curtailment."
-        ),
-
-        'power_solar': (
-            "Low output in normal sunlight may indicate inverter derating, "
-            "shading or soiling."
-        ),
-
-        'review': (
-            "This reading differs from the usual operating pattern. "
-            "Verify the sensor readings and review operating conditions "
-            "before drawing a conclusion."
+        meaning = (
+            "An unusual sensor pattern was detected. "
+            "Further inspection is needed before identifying "
+            "a possible cause."
         )
-    }
 
-    # Event duration and timing.
+    # Event time.
+
     n = len(e)
 
     when = (
         f"day {int(e.day.iloc[0])}, "
         f"{int(e.hour.iloc[0]):02d}:00"
-        + (f" for {n} hours" if n > 1 else "")
     )
 
+    if n > 1:
+        when += f" for {n} hours"
+
     # Event severity.
-    sev = (
-        'high'
-        if (e.severity == 'high').any()
-        else 'medium'
-        if (e.severity == 'medium').any()
-        else 'watch'
+
+    severity = (
+        "high"
+        if (e.severity == "high").any()
+        else "medium"
+        if (e.severity == "medium").any()
+        else "watch"
     )
+
+    # Return event details.
+
+    signals = []
+
+    if vib:
+        signals.append("vibration")
+
+    if temp_high or temp_low:
+        signals.append("temperature")
+
+    if power_low:
+        signals.append("power")
 
     return {
 
-        'asset_id': aid,
+        "asset_id": aid,
 
-        'when': when,
+        "when": when,
 
-        'hours': n,
+        "hours": n,
 
-        'severity': sev,
+        "severity": severity,
 
-        'start_index': int(e.timestamp_id.iloc[0]),
+        "start_index": int(e.timestamp_id.iloc[0]),
 
-        'end_index': int(e.timestamp_id.iloc[-1]),
+        "end_index": int(e.timestamp_id.iloc[-1]),
 
-        'signals': [
-            s for s, on in (
-                ('vibration', vib),
-                ('temperature', tmp),
-                ('power', pw)
-            )
-            if on
-        ],
+        "signals": signals,
 
-        'explanation': (
-            f"On {aid}, {' and '.join(parts)}. "
-            f"{meanings[key]}"
+        "explanation": (
+            f"On {aid}, "
+            f"{' and '.join(parts)}. "
+            f"{meaning}"
         ),
 
-        'recommended_checks': CHECKS[key],
+        "recommended_checks": CHECKS[key],
 
-        'score': float(e.if_score.max())
+        "score": float(e.if_score.max())
     }
 
 
 # --------------------------------------------------
-# GROUP READINGS INTO EVENTS
+# GROUP ANOMALIES INTO EVENTS
 # --------------------------------------------------
 
 def build_events(f):
-    """Group consecutive abnormal readings into events."""
 
     events = []
 
-    for aid, g in f[f.flagged].groupby('asset_id'):
+    for aid, g in f[f.flagged].groupby("asset_id"):
 
         grp = (
             g.timestamp_id.diff()
-            .fillna(1) > 1
-        ).cumsum()
+            .fillna(1)
+            .gt(1)
+            .cumsum()
+        )
 
-        events += [
-            _event(aid, e, f)
-            for _, e in g.groupby(grp)
-        ]
+        for _, e in g.groupby(grp):
+
+            events.append(
+                _event(aid, e, f)
+            )
 
     order = {
-        'high': 0,
-        'medium': 1,
-        'watch': 2
+        "high": 0,
+        "medium": 1,
+        "watch": 2
     }
 
     return sorted(
         events,
         key=lambda e: (
-            order[e['severity']],
-            -e['score']
+            order[e["severity"]],
+            -e["score"]
         )
     )
 
@@ -505,27 +577,30 @@ def build_events(f):
 # --------------------------------------------------
 
 def evaluate(df, n=24, seed=0):
-    """Evaluate detection using injected synthetic faults.
 
-    The dataset has no labelled real faults.
-    Therefore, these metrics measure detection of injected
-    faults and must not be interpreted as real-world accuracy.
+    """Evaluate detection by injecting synthetic faults.
+
+    This is not a substitute for evaluation against
+    real labelled operational failures.
     """
 
-    if n <= 0:
-        raise ValueError("Number of injected faults must be positive.")
+    if n <= 0 or n % 3 != 0:
+        raise ValueError(
+            "n must be a positive multiple of 3."
+        )
 
     base = detect(df)
 
-    # Exclude anomalies already present in the original dataset.
-    known = set(base.index[base.flagged])
+    known = set(
+        base.index[base.flagged]
+    )
 
     rng = np.random.default_rng(seed)
 
     kinds = [
-        'bearing',
-        'overheat',
-        'underperf'
+        "bearing",
+        "overheat",
+        "underperf"
     ]
 
     d = df.copy()
@@ -534,52 +609,56 @@ def evaluate(df, n=24, seed=0):
 
     for i in range(n):
 
-        kind = kinds[i % len(kinds)]
+        kind = kinds[i % 3]
 
         pool = [
             j for j in d.index
             if j not in known
             and j not in injected
             and (
-                kind != 'underperf'
-                or d.at[j, 'power_mw'] > 0.3
+                kind != "underperf"
+                or d.at[j, "power_mw"] > 0.3
             )
         ]
 
         if not pool:
             raise ValueError(
-                f"Not enough eligible rows to inject {kind} faults."
+                "Not enough suitable rows for fault injection."
             )
 
         j = int(rng.choice(pool))
 
-        # Inject synthetic fault patterns.
-        if kind == 'bearing':
+        if kind == "bearing":
 
-            d.at[j, 'vibration_mm_s'] *= 2.7
+            d.at[j, "vibration_mm_s"] *= 2.7
 
-            d.at[j, 'temperature_c'] += 12
+            d.at[j, "temperature_c"] += 12
 
-        elif kind == 'overheat':
+        elif kind == "overheat":
 
-            d.at[j, 'temperature_c'] += 18
+            d.at[j, "temperature_c"] += 18
 
         else:
 
-            d.at[j, 'power_mw'] *= 0.4
+            d.at[j, "power_mw"] *= 0.4
 
         injected[j] = kind
 
-    # Run detection again after fault injection.
     f = detect(d)
 
-    hit = set(f.index[f.flagged]) - known
+    hit = (
+        set(f.index[f.flagged])
+        - known
+    )
 
-    true_positives = len(hit & set(injected))
+    true_positives = len(
+        hit & set(injected)
+    )
 
-    false_positives = len(hit - set(injected))
+    false_positives = len(
+        hit - set(injected)
+    )
 
-    # Calculate recall separately for each fault type.
     recall_by_fault = {}
 
     for kind in kinds:
@@ -597,36 +676,40 @@ def evaluate(df, n=24, seed=0):
         recall_by_fault[kind] = round(
             detected / total,
             2
-        ) if total else None
+        )
+
+    recall = true_positives / n
 
     precision = (
-        true_positives / (true_positives + false_positives)
+        true_positives
+        / (true_positives + false_positives)
         if true_positives + false_positives
         else None
     )
 
     return {
 
-        'method': (
-            f'synthetic fault injection ({n} faults: '
-            'bearing, overheating, under-performance)'
+        "method": (
+            f"synthetic fault injection "
+            f"({n} faults: bearing, overheating, "
+            f"under-performance)"
         ),
 
-        'injected': n,
+        "injected": n,
 
-        'detected': true_positives,
+        "detected": true_positives,
 
-        'false_alarms': false_positives,
+        "false_alarms": false_positives,
 
-        'recall': round(true_positives / n, 2),
+        "recall": round(recall, 2),
 
-        'precision': (
+        "precision": (
             round(precision, 2)
             if precision is not None
             else None
         ),
 
-        'recall_by_fault': recall_by_fault,
+        "recall_by_fault": recall_by_fault,
 
-        'real_anomalies_in_data': len(known)
+        "real_anomalies_in_data": len(known)
     }
